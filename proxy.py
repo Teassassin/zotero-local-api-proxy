@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import mimetypes
 import logging
+import os
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPSConnection, HTTPResponse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -157,6 +158,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if self._serve_redirected_local_file(upstream_resp):
                 return
 
+            if self._serve_file_url_body(path, upstream_resp):
+                return
+
+            fallback_target, fallback_path = self._build_attachment_fallback_target(path, query, server)
+            if upstream_resp.status == HTTPStatus.NOT_FOUND and fallback_target is not None and fallback_path is not None:
+                upstream_resp.close()
+                conn.close()
+
+                conn = connection_cls(
+                    host=server.upstream_host,
+                    port=server.upstream_port,
+                    timeout=server.timeout,
+                )
+                conn.request(self.command, fallback_target, body=body, headers=headers)
+                upstream_resp = conn.getresponse()
+
+                if self._serve_redirected_local_file(upstream_resp):
+                    return
+
+                if self._serve_file_url_body(fallback_path, upstream_resp):
+                    return
+
             self.send_response(upstream_resp.status, upstream_resp.reason)
             response_headers = self._filter_response_headers(upstream_resp.getheaders())
             content_length = upstream_resp.getheader("Content-Length")
@@ -183,6 +206,51 @@ class ProxyHandler(BaseHTTPRequestHandler):
             upstream_resp.close()
             conn.close()
 
+    @staticmethod
+    def _build_attachment_fallback_target(path: str, query: str, server: ProxyServer) -> tuple[str | None, str | None]:
+        if path.endswith("/file"):
+            fallback_path = f"{path}/view/url"
+        elif path.endswith("/file/view"):
+            fallback_path = f"{path}/url"
+        else:
+            return None, None
+
+        upstream_target = f"{server.upstream_base_path}{fallback_path}"
+        if query:
+            upstream_target = f"{upstream_target}?{query}"
+        elif server.upstream_query:
+            upstream_target = f"{upstream_target}?{server.upstream_query}"
+        return upstream_target, fallback_path
+
+    def _serve_file_url_body(self, path: str, upstream_resp: HTTPResponse) -> bool:
+        if not path.endswith("/file/view/url"):
+            return False
+        if upstream_resp.status != HTTPStatus.OK:
+            return False
+
+        payload = upstream_resp.read()
+        payload_text = payload.decode("utf-8", errors="replace").strip()
+        parsed = urlsplit(payload_text)
+        if parsed.scheme == "file":
+            file_path = self._file_url_to_path(parsed)
+            return self._serve_local_file(file_path, upstream_resp.getheader("Content-Type"))
+
+        self.send_response(upstream_resp.status, upstream_resp.reason)
+        response_headers = self._filter_response_headers(upstream_resp.getheaders())
+        for key, value in response_headers.items():
+            self.send_header(key, value)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Expose-Headers", "*")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        if self.command != "HEAD":
+            self.wfile.write(payload)
+
+        return True
+
     def _serve_redirected_local_file(self, upstream_resp: HTTPResponse) -> bool:
         if upstream_resp.status not in {HTTPStatus.MOVED_PERMANENTLY, HTTPStatus.FOUND, HTTPStatus.SEE_OTHER, HTTPStatus.TEMPORARY_REDIRECT, HTTPStatus.PERMANENT_REDIRECT}:
             return False
@@ -196,6 +264,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return False
 
         file_path = self._file_url_to_path(parsed)
+        return self._serve_local_file(file_path, upstream_resp.getheader("Content-Type"))
+
+    def _serve_local_file(self, file_path: Path, upstream_content_type: str | None) -> bool:
         try:
             file_size = file_path.stat().st_size
         except FileNotFoundError:
@@ -225,7 +296,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             status = HTTPStatus.PARTIAL_CONTENT
 
         content_length = max(end - start + 1, 0)
-        content_type = mimetypes.guess_type(file_path.name)[0] or upstream_resp.getheader("Content-Type") or "application/octet-stream"
+        content_type = mimetypes.guess_type(file_path.name)[0] or upstream_content_type or "application/octet-stream"
 
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -261,7 +332,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
             raw_path = f"//{parsed_url.netloc}{raw_path}"
         elif len(raw_path) >= 3 and raw_path.startswith("/") and raw_path[2] == ":":
             raw_path = raw_path[1:]
-        return Path(raw_path)
+
+        candidates = [Path(raw_path)]
+        if os.name != "nt" and len(raw_path) >= 3 and raw_path[1] == ":":
+            drive_letter = raw_path[0].lower()
+            rest_path = raw_path[2:]
+            candidates.append(Path(f"/mnt/{drive_letter}{rest_path}"))
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
 
     @staticmethod
     def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, int] | None:
